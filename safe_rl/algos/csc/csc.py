@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
-import gym
+import gymnasium as gym
 import time
 import yaml
 import safe_rl.algos.csc.core as core
@@ -299,13 +299,14 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Instantiate environment
     env = env_fn()
-    test_env = env.env
+    test_env = env  # env.env
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
-    rew_range = env.reward_range
+    # rew_range = env.reward_range
+    rew_range = [0, 1]
     v_range = (scaling*rew_range[0], scaling*rew_range[1])
     vc_range = (0, scaling*1)
-    max_ep_len = min(max_ep_len, env.env._max_episode_steps)
+    max_ep_len = min(max_ep_len, env.env.max_episode_steps)
 
     # Create actor-critic module
     ac = actor_critic(env.observation_space, env.action_space, v_range=v_range,

@@ -15,7 +15,8 @@ setup(
     version=__version__,#'0.1',
     install_requires=[
         'cloudpickle==1.2.1',
-        'gym[atari,box2d,classic_control]',
+        # 'gym[atari,box2d,classic_control]',
+        'gymnasium',
         'ipython',
         'joblib',
         'matplotlib',
@@ -26,7 +27,8 @@ setup(
         'psutil',
         'pyyaml',
         'scipy',
-        'torch==1.3.1',
+        # 'torch==1.3.1',
+        'torch',
         'tqdm'
     ],
 )
