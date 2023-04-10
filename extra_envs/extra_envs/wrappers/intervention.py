@@ -23,16 +23,18 @@ class Intervention(gym.Wrapper):
 
     def reset(self, **kwargs):
         self.intervener.reset(**kwargs)
-        return self.env.reset()
+        ret, _ = self.env.reset()
+        return ret
 
     def step(self, action=None):
         """
         If action is None, we intervene.
         """
-        self.intervener.set_state(self.env.get_state())
+        # self.intervener.set_state(self.env.get_state())
 
         if action is not None and not self.intervener.should_intervene(action):
-            o, r, d, info = self.env.step(action)
+            o, r, term, trunc, info = self.env.step(action)
+            d = term or trunc
             info['intervened'] = False
             return o, r, d, info
 
@@ -40,7 +42,8 @@ class Intervention(gym.Wrapper):
 
         if self.intervener.mode == Intervener.MODE.SAFE_ACTION:
             a_safe = self.intervener.safe_action()
-            o, r, d, info = self.env.step(a_safe)
+            o, r, term, trunc, info = self.env.step(a_safe)
+            d = term or trunc
             info_intv = dict(intervened=True,
                              safe_action=a_safe,
                              safe_step_output=(o, r, d, info))

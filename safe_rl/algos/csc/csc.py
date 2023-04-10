@@ -299,7 +299,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Instantiate environment
     env = env_fn()
-    test_env = env  # env.env
+    test_env = env.env
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
     # rew_range = env.reward_range
@@ -475,9 +475,11 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     def test_agent():
         for _ in range(local_num_test_episodes):
             o, d, ep_ret, ep_cost, ep_len = test_env.reset(), False, 0, 0, 0
+            o, _ = o
             while not (d or ep_len == max_ep_len):
                 a = ac.act(torch.as_tensor(o, dtype=torch.float32), deterministic=True)
-                o, r, d, info = test_env.step(a)
+                o, r, term, trunc, info = test_env.step(a)
+                d = term or trunc
                 ep_ret += r
                 ep_cost += info.get('cost', 0.)
                 ep_len += 1
