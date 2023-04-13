@@ -14,12 +14,13 @@ def combined_shape(length, shape=None):
     return (length, shape) if np.isscalar(shape) else (length, *shape)
 
 
-def mlp(sizes, activation, output_activation=nn.Identity):
+def mlp(sizes, activation, output_activation=nn.Identity, cuda=False):
     layers = []
     for j in range(len(sizes)-1):
         act = activation if j < len(sizes)-2 else output_activation
         layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
-    return nn.Sequential(*layers)
+    device = torch.device('cuda' if cuda else 'cpu')
+    return nn.Sequential(*layers).to(device)
 
 
 def count_vars(module):
@@ -65,9 +66,9 @@ class Actor(nn.Module):
 
 class MLPCategoricalActor(Actor):
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation):
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, cuda=False):
         super().__init__()
-        self.logits_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
+        self.logits_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation, cuda=cuda)
 
     def _distribution(self, obs):
         logits = self.logits_net(obs)
@@ -79,16 +80,17 @@ class MLPCategoricalActor(Actor):
 
 class MLPGaussianActor(Actor):
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, pred_std=False):
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, pred_std=False, cuda=False):
         super().__init__()
         self.act_dim = act_dim
         self.pred_std = pred_std
+        self.device = torch.device('cuda' if cuda else 'cpu')
         if pred_std:
-            self.pi_net = mlp([obs_dim] + list(hidden_sizes) + [2*act_dim], activation)
+            self.pi_net = mlp([obs_dim] + list(hidden_sizes) + [2*act_dim], activation, cuda=cuda)
         else:
             log_std = -0.5 * np.ones(act_dim, dtype=np.float32)
-            self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
-            self.mu_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation)
+            self.log_std = torch.nn.Parameter(torch.as_tensor(log_std).to(self.device))
+            self.mu_net = mlp([obs_dim] + list(hidden_sizes) + [act_dim], activation, cuda=cuda)
 
     def _distribution(self, obs):
         if self.pred_std:
@@ -112,9 +114,9 @@ class MLPGaussianActor(Actor):
 class MLPCritic(nn.Module):
 
     def __init__(self, obs_dim, hidden_sizes, activation,
-                 rnge=(float('-inf'), float('inf'))):
+                 rnge=(float('-inf'), float('inf')), cuda=False):
         super().__init__()
-        self.v_net = mlp([obs_dim] + list(hidden_sizes) + [1], activation)
+        self.v_net = mlp([obs_dim] + list(hidden_sizes) + [1], activation, cuda=cuda)
         self.rnge = rnge
 
     def forward(self, obs):
@@ -122,9 +124,9 @@ class MLPCritic(nn.Module):
 
 class MLPQFunction(nn.Module):
 
-    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, q_range):
+    def __init__(self, obs_dim, act_dim, hidden_sizes, activation, q_range, cuda=False):
         super().__init__()
-        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation)
+        self.q = mlp([obs_dim + act_dim] + list(hidden_sizes) + [1], activation, cuda=cuda)
         self.range = q_range
 
     def forward(self, obs, act):
@@ -139,7 +141,7 @@ class MLPActorCritic(nn.Module):
                  hidden_sizes=(64,64), activation=nn.Tanh,
                  v_range=(float('-inf'), float('inf')),
                  vc_range=(float('-inf'), float('inf')),
-                 pred_std=False, eps=0.01):
+                 pred_std=False, eps=0.01, cuda=False):
         super().__init__()
 
         obs_dim = observation_space.shape[0]
@@ -148,13 +150,15 @@ class MLPActorCritic(nn.Module):
         # policy builder depends on action space
         if isinstance(action_space, Box):
             self.pi = MLPGaussianActor(obs_dim, action_space.shape[0], hidden_sizes,
-                                       activation, pred_std=pred_std)
+                                       activation, pred_std=pred_std, cuda=cuda)
         elif isinstance(action_space, Discrete):
-            self.pi = MLPCategoricalActor(obs_dim, action_space.n, hidden_sizes, activation)
+            self.pi = MLPCategoricalActor(obs_dim, action_space.n, hidden_sizes, activation,
+                    cuda=cuda)
 
         # build value function
-        self.v  = MLPCritic(obs_dim, hidden_sizes, activation, v_range)
-        self.qc = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation, vc_range)
+        self.v  = MLPCritic(obs_dim, hidden_sizes, activation, v_range, cuda=cuda)
+        self.qc = MLPQFunction(obs_dim, act_dim, hidden_sizes, activation, vc_range,
+                cuda=cuda)
 
         self.eps = eps*vc_range[1]
 
@@ -172,10 +176,10 @@ class MLPActorCritic(nn.Module):
             logp_a = self.pi._log_prob_from_distribution(pi, a)
             v = torch.clamp(self.v(obs), *self.v.rnge)
             vc = qcs.mean()
-        return a.numpy(), v.numpy(), vc.numpy(), logp_a.numpy()
+        return a.cpu().numpy(), v.cpu().numpy(), vc.cpu().numpy(), logp_a.cpu().numpy()
 
     def act(self, obs, deterministic=False):
         if deterministic:
             with torch.no_grad():
-                return self.pi.mean_act(obs).numpy()
+                return self.pi.mean_act(obs).cpu().numpy()
         return self.step(obs, mask=False)[0]

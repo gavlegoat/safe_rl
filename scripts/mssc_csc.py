@@ -24,7 +24,7 @@ parser.add_argument('--l', type=int, default=2)
 
 # Sampling
 parser.add_argument('--steps', type=int, default=4000)
-parser.add_argument('--cpu', type=int, default=4)
+parser.add_argument('--cpu', type=int, default=1)
 
 # Optimization
 parser.add_argument('--gamma', type=float, default=0.99)
@@ -45,7 +45,7 @@ parser.add_argument('--intv_config', type=str, default='',
 parser.add_argument('--model_config', type=str, default='model/unbiased.yaml')
 
 # Misc.
-parser.add_argument('--exp_name', type=str, default='point')
+# parser.add_argument('--exp_name', type=str, default='point')
 parser.add_argument('--seed', '-s', type=int, default=0)
 parser.add_argument('--cost_smoothing', type=float, default=0.)
 parser.add_argument('--num_test_episodes', type=int, default=10)
@@ -54,7 +54,7 @@ parser.add_argument('--alpha', type=float, default=5.)
 args = parser.parse_args()
 
 mpi_fork(args.cpu)
-logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
+logger_kwargs = setup_logger_kwargs(args.env_name, args.seed)
 
 if args.intv_config == '':
     do_intv = False

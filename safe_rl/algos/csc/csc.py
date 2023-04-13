@@ -3,11 +3,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
+from torch.distributions.kl import kl_divergence
 import gymnasium as gym
 import time
 import yaml
 import safe_rl.algos.csc.core as core
-from safe_rl.utils.logx import EpochLogger
+from safe_rl.utils.logx import EpochLogger, DummyLogger
 from safe_rl.utils.mpi_pytorch import setup_pytorch_for_mpi, sync_params, mpi_avg_grads
 from safe_rl.utils.mpi_tools import (mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar,
                                     num_procs, mpi_sum)
@@ -23,7 +24,7 @@ class CPPOBuffer:
     """
 
     def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95, scaling=1.,
-                 normalize_adv=False):
+                 normalize_adv=False, cuda=False):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
 
@@ -44,6 +45,8 @@ class CPPOBuffer:
         self.normalize_adv = normalize_adv
         self.gamma, self.lam, self.scaling = gamma, lam, scaling
         self.ptr, self.path_start_idx, self.max_size = 0, 0, size
+
+        self.device = torch.device('cuda' if cuda else 'cpu')
 
     def store(self, obs, act, rew, val, cost, cval, intv, logp):
         """
@@ -124,12 +127,13 @@ class CPPOBuffer:
 
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
                     cret=self.cret_buf, adv=lagrange_adv_buf, logp=self.logp_buf)
-        out = {k: torch.as_tensor(v, dtype=torch.float32) for k,v in data.items()}
+        out = {k: torch.as_tensor(v, dtype=torch.float32).to(self.device)
+                for k,v in data.items()}
         out.update(intv=self.intv_buf)
         return out
 
 class CSCBuffer:
-    def __init__(self, obs_dim, act_dim, size, scaling=1.):
+    def __init__(self, obs_dim, act_dim, size, scaling=1., cuda=False):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
@@ -137,6 +141,7 @@ class CSCBuffer:
         self.done_buf = np.zeros(size, dtype=np.float32)
         self.scaling = scaling
         self.ptr, self.size, self.max_size = 0, 0, size
+        self.device = torch.device('cuda' if cuda else 'cpu')
 
     def store(self, obs, act, cost, next_obs, done):
         self.obs_buf[self.ptr] = obs
@@ -154,18 +159,21 @@ class CSCBuffer:
                      act=self.act_buf[idxs],
                      cost=self.cost_buf[idxs],
                      done=self.done_buf[idxs])
-        return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in batch.items()}
+        return {k: torch.as_tensor(v, dtype=torch.float32).to(self.device)
+                for k, v in batch.items()}
 
 def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=1e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, logger_kwargs=dict(), save_freq=10,
+        target_kl=0.01, logger_kwargs=dict(), use_logger=True, save_freq=10,
         num_test_episodes=10, ent_bonus=0.001, scaling=100., dont_normalize_adv=False,
         # Cost constraint/penalties
         cost_lim=0.01, penalty=1., penalty_lr=5e-2, update_penalty_every=1,
         optimize_penalty=False, ignore_unsafe_cost=False,
         # CSC
-        replay_size=int(1e6), batch_size=100, alpha=5., polyak=0.995
+        replay_size=int(1e6), batch_size=100, alpha=5., polyak=0.995,
+        # If oracle is not None, use imitation learning
+        oracle=None, cuda=False
         ):
     """
     Proximal Policy Optimization (by clipping),
@@ -283,19 +291,27 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         ignore_unsafe_cost (bool): Whether to consider the unsafe cost when computing the
             cost.
+
+        oracle: A callable object which gives a distribution over actions when
+            called with a state. If not None, then the policy is trained to
+            imitate the oracle rather than to optimize the reward.
     """
 
     # Special function to avoid certain slowdowns from PyTorch + MPI combo.
     setup_pytorch_for_mpi()
 
     # Set up logger and save configuration
-    logger = EpochLogger(**logger_kwargs)
+    if use_logger:
+        logger = EpochLogger(**logger_kwargs)
+    else:
+        logger = DummyLogger()
     logger.save_config(locals())
 
     # Random seed
     seed += 10000 * proc_id()
     torch.manual_seed(seed)
     np.random.seed(seed)
+    device = torch.device('cuda' if cuda else 'cpu')
 
     # Instantiate environment
     env = env_fn()
@@ -310,7 +326,8 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Create actor-critic module
     ac = actor_critic(env.observation_space, env.action_space, v_range=v_range,
-                      vc_range=vc_range, pred_std=True, eps=cost_lim, **ac_kwargs)
+                      vc_range=vc_range, pred_std=True, eps=cost_lim, **ac_kwargs,
+                      cuda=cuda)
     ac_targ = deepcopy(ac)
 
     # Sync params across processes
@@ -323,19 +340,19 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs())
     buf = CPPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam, scaling,
-                     normalize_adv=not dont_normalize_adv)
-    csc_buf = CSCBuffer(obs_dim, act_dim, replay_size, scaling)
+                     normalize_adv=not dont_normalize_adv, cuda=cuda)
+    csc_buf = CSCBuffer(obs_dim, act_dim, replay_size, scaling, cuda=cuda)
 
     # Penalty learning
     if optimize_penalty:
         #penalty_param_init = max(np.log(penalty), -100.)
         penalty_param_init = max(np.log(np.exp(penalty)-1), -100.)
         penalty_param = torch.tensor([penalty_param_init], requires_grad=True,
-                                     dtype=torch.float32)
+                                     dtype=torch.float32).to(device)
         #penalty_torch = torch.exp(penalty_param)
         penalty_torch = F.softplus(penalty_param)
     else:
-        penalty_torch = torch.tensor([penalty], dtype=torch.float32)
+        penalty_torch = torch.tensor([penalty], dtype=torch.float32).to(device)
 
     # Set up function for computing PPO policy loss
     def compute_loss_pi(data):
@@ -346,9 +363,13 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # Policy loss
         pi, logp = ac.pi(obs, act)
         ratio = torch.exp(logp - logp_old)
-        clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
         ent = pi.entropy().mean().item()
-        loss_pi = -(torch.min(ratio * adv, clip_adv) + ent_bonus*ent).mean()
+        if oracle is None:
+            clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
+            loss_pi = -(torch.min(ratio * adv, clip_adv) + ent_bonus*ent).mean()
+        else:
+            oracle_pi = oracle(obs)
+            loss_pi = kl_divergence(pi, oracle_pi).mean()
 
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
@@ -393,7 +414,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
         loss = loss_fn(q, backup) + alpha*(q-q_pi).mean()
         #loss = loss_fn(q, backup) - alpha*q_pi.mean()
-        loss_info = dict(QcVals=q.detach().numpy())
+        loss_info = dict(QcVals=q.detach().cpu().numpy())
 
         return loss, loss_info
 
@@ -451,9 +472,9 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             penalty_optimizer.zero_grad()
             loss_pen = compute_loss_penalty(curr_cost)
             loss_pen.backward()
-            penalty_param_np = penalty_param.grad.numpy()
+            penalty_param_np = penalty_param.grad.cpu().numpy()
             avg_grad = mpi_avg(penalty_param_np)
-            penalty_param.grad = torch.as_tensor(avg_grad)
+            penalty_param.grad = torch.as_tensor(avg_grad).to(device)
             penalty_optimizer.step()
 
         with torch.no_grad():
@@ -477,7 +498,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             o, d, ep_ret, ep_cost, ep_len = test_env.reset(), False, 0, 0, 0
             o, _ = o
             while not (d or ep_len == max_ep_len):
-                a = ac.act(torch.as_tensor(o, dtype=torch.float32), deterministic=True)
+                a = ac.act(torch.as_tensor(o, dtype=torch.float32).to(device), deterministic=True)
                 o, r, term, trunc, info = test_env.step(a)
                 d = term or trunc
                 ep_ret += r
@@ -498,7 +519,10 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             penalty_torch = F.softplus(penalty_param)
 
         for t in range(local_steps_per_epoch):
-            a, v, vc, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            # print("DEBUG o:", o)
+            ret = ac.step(torch.as_tensor(o, dtype=torch.float32).to(device))
+            # print("DEBUG ret:", ret)
+            a, v, vc, logp = ret
             next_o, r, d, info = env.step(a)
 
             intervened = info.get('intervened', False)
@@ -582,7 +606,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     v = 0.
                     vc = (1-ignore_unsafe_cost)*vc_range[1]
                 elif timeout or epoch_ended:
-                    _, v, vc, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
+                    _, v, vc, _ = ac.step(torch.as_tensor(o, dtype=torch.float32).to(device))
                 else:
                     v = vc = 0
                 buf.finish_path(v, vc)
@@ -672,3 +696,5 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         logger.log_tabular('Time', time.time()-start_time)
         logger.log_tabular('TotalEnvInteracts', (epoch+1)*steps_per_epoch)
         logger.dump_tabular()
+
+    return ac

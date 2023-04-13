@@ -313,3 +313,21 @@ class EpochLogger(Logger):
         v = self.epoch_dict[key]
         vals = np.concatenate(v) if isinstance(v[0], np.ndarray) and len(v[0].shape)>0 else v
         return mpi_statistics_scalar(vals)
+
+class DummyLogger(EpochLogger):
+    """
+    This is identical to an EpochLogger except it does not write any data to disk.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def save_config(self, config):
+        pass
+
+    def save_state(self, state_dict, itr=None):
+        pass
+
+    def dump_tabular(self):
+        self.log_current_row.clear()
+        self.first_row=False
