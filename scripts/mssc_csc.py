@@ -9,6 +9,8 @@ from safe_rl.utils.mpi_tools import mpi_fork
 from safe_rl.utils.run_utils import setup_logger_kwargs
 from extra_envs.wrappers import Intervention
 from extra_envs.intervener import Intervener
+import torch
+from torch.distributions.normal import Normal
 
 import sys
 sys.path.append('/home/greg/neural-revel/src')
@@ -87,6 +89,9 @@ def env_fn():
     intervener = IntervenerCls(**intv_kwargs)
     return Intervention(env, intervener)
 
+def oracle(state):
+    return Normal(torch.tensor([1., 1.]), torch.tensor([0.2, 0.2]))
+
 csc(env_fn, actor_critic=core.MLPActorCritic,
      ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, seed=args.seed,
      dont_normalize_adv=args.dont_normalize_adv, steps_per_epoch=args.steps,
@@ -94,4 +99,4 @@ csc(env_fn, actor_critic=core.MLPActorCritic,
      penalty=args.penalty, optimize_penalty=args.optimize_penalty,
      penalty_lr=args.penalty_lr, ent_bonus=args.ent_bonus,
      ignore_unsafe_cost=args.ignore_unsafe_cost, num_test_episodes=args.num_test_episodes,
-     alpha=args.alpha)
+     alpha=args.alpha) # , oracle=oracle)

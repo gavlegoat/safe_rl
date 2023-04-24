@@ -326,8 +326,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Create actor-critic module
     ac = actor_critic(env.observation_space, env.action_space, v_range=v_range,
-                      vc_range=vc_range, pred_std=True, eps=cost_lim, **ac_kwargs,
-                      cuda=cuda)
+                      vc_range=vc_range, eps=cost_lim, **ac_kwargs, cuda=cuda)
     ac_targ = deepcopy(ac)
 
     # Sync params across processes
@@ -348,7 +347,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         #penalty_param_init = max(np.log(penalty), -100.)
         penalty_param_init = max(np.log(np.exp(penalty)-1), -100.)
         penalty_param = torch.tensor([penalty_param_init], requires_grad=True,
-                                     dtype=torch.float32).to(device)
+                                     dtype=torch.float32, device=device)
         #penalty_torch = torch.exp(penalty_param)
         penalty_torch = F.softplus(penalty_param)
     else:
@@ -369,7 +368,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_pi = -(torch.min(ratio * adv, clip_adv) + ent_bonus*ent).mean()
         else:
             oracle_pi = oracle(obs)
-            loss_pi = kl_divergence(pi, oracle_pi).mean()
+            loss_pi = (kl_divergence(pi, oracle_pi) - ent_bonus * ent).mean()
 
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
@@ -509,6 +508,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     # Prepare for interaction with environment
     start_time = time.time()
     o, ep_ret, ep_cost, ep_len, cum_cost, cum_viol = env.reset(), 0, 0, 0, 0, 0
+    cum_rew = 0.
     ep_surr_cost, cum_surr_cost = 0, 0
     already_intv, local_episodes = False, 1
 
@@ -535,6 +535,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 ep_len += 1
                 cum_cost += c
                 cum_viol += violation
+                cum_rew += r
 
                 surr_c = (1-ignore_unsafe_cost)*c
                 ep_surr_cost += surr_c
@@ -552,6 +553,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 ep_len += 1
                 cum_cost += c_safe
                 cum_viol += violation
+                cum_rew += r_safe
 
                 ep_surr_cost += 1.
                 cum_surr_cost += 1.
@@ -584,6 +586,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                         ep_cost += c_safe
                         ep_len += 1
                         cum_cost += c_safe
+                        cum_rew += r_safe
                 elif env.intervener.mode == env.intervener.MODE.TERMINATE:
                     pass
                 else:
@@ -632,15 +635,20 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         cumulative_cost = mpi_sum(cum_cost)
         cumulative_surr_cost = mpi_sum(cum_surr_cost)
         cumulative_violations = mpi_sum(cum_viol)
+        cumulative_reward = mpi_sum(cum_rew)
         episodes = mpi_sum(local_episodes)
 
         cost_rate = cumulative_cost / episodes
         surr_cost_rate = cumulative_surr_cost / episodes
         viol_rate = cumulative_violations / episodes
+        ave_rew = cumulative_reward / episodes
 
         # Test the performance of the deterministic version of the agent.
         test_agent()
         o = env.reset()
+
+        if not use_logger:
+            print(f"CSC Log: Epoch {epoch}, Ret {ave_rew}, Cost {cost_rate}")
 
         # Log info about epoch
         logger.log_tabular('Epoch', epoch)
