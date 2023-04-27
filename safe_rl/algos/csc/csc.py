@@ -617,7 +617,30 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     # only save EpRet / EpLen if trajectory finished
                     logger.store(EpRet=ep_ret, EpCost=ep_cost, EpLen=ep_len,
                                  EpSurrCost=ep_surr_cost)
-                o, ep_ret, ep_cost, ep_len = env.reset(), 0, 0, 0
+                sample_init_done = False
+                while not sample_init_done:
+                    o, ep_ret, ep_cost, ep_len = env.reset(), 0, 0, 0
+                    # Choose a number of steps to take under the blended policy
+                    # before starting the backup policy. This is scheduled
+                    # linearly over epochs so that at the beginning we take very
+                    # few steps under the blended policy and by the end of
+                    # training each episode is up to 70% blended data.
+                    max_oracle_steps = int(0.7 * epoch / epochs * max_ep_len)
+                    oracle_steps = max(1, np.random.randint(max_oracle_steps))
+                    sample_init_done = True
+                    for _ in range(oracle_steps):
+                        st = torch.tensor(o, dtype=torch.float32).to(device)
+                        pi = oracle(st)
+                        act = pi.sample()
+                        safety = torch.clamp(ac.qc(st, act), *ac.qc.range)
+                        if safety.item() > cost_lim:
+                            act = ac.act(st)
+                        else:
+                            act = act.detach().cpu().numpy()
+                        o, _, d, _ = env.step(act)
+                        if d:
+                            sample_init_done = False
+                            break
                 ep_surr_cost, already_intv = 0, False
                 local_episodes += 1
             elif intervened and env.intervener.mode == Intervener.MODE.SAFE_ACTION:
