@@ -16,6 +16,20 @@ from extra_envs.wrappers import Intervention
 from extra_envs.intervener.base import Intervener
 
 
+def multi_kl_divergence(a, b):
+    """
+    Compute the KL divergence between normal distributions a and b. This is necessary
+    because a and b are assumed to be torch.distribution.Normal objects, and
+    torch.distributions.kl.kl_divergence computes the KL between these two as a batch
+    of divergences between single-dimensional distributions. In this function we
+    convert the two Normal objects to torch.distributions.MultivariateNormal in order
+    to fix this problem.
+    """
+    am = torch.distributions.MultivariateNormal(a.loc, torch.diag_embed(a.scale))
+    bm = torch.distributions.MultivariateNormal(b.loc, torch.diag_embed(b.scale))
+    return kl_divergence(am, bm).item()
+
+
 class CPPOBuffer:
     """
     A buffer for storing trajectories experienced by a PPO agent interacting
@@ -173,7 +187,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # CSC
         replay_size=int(1e6), batch_size=100, alpha=5., polyak=0.995,
         # If oracle is not None, use imitation learning
-        oracle=None, cuda=False
+        oracle=None, cuda=False, reset_data=None
         ):
     """
     Proximal Policy Optimization (by clipping),
@@ -318,8 +332,8 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
     test_env = env.env
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
-    # rew_range = env.reward_range
-    rew_range = [0, 1]
+    rew_range = env.reward_range
+    # rew_range = [0, 1]
     v_range = (scaling*rew_range[0], scaling*rew_range[1])
     vc_range = (0, scaling*1)
     max_ep_len = min(max_ep_len, env.env.max_episode_steps)
@@ -363,12 +377,8 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         pi, logp = ac.pi(obs, act)
         ratio = torch.exp(logp - logp_old)
         ent = pi.entropy().mean().item()
-        if oracle is None:
-            clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
-            loss_pi = -(torch.min(ratio * adv, clip_adv) + ent_bonus*ent).mean()
-        else:
-            oracle_pi = oracle(obs)
-            loss_pi = (kl_divergence(pi, oracle_pi) - ent_bonus * ent).mean()
+        clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
+        loss_pi = -(torch.min(ratio * adv, clip_adv) + ent_bonus*ent).mean()
 
         # Useful extra info
         approx_kl = (logp_old - logp).mean().item()
@@ -418,9 +428,9 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         return loss, loss_info
 
     # Set up optimizers for policy and value function
-    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr)
-    vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr)
-    qcf_optimizer = Adam(ac.qc.parameters(), lr=vf_lr)
+    pi_optimizer = Adam(ac.pi.parameters(), lr=pi_lr, weight_decay=1e-4)
+    vf_optimizer = Adam(ac.v.parameters(), lr=vf_lr, weight_decay=1e-4)
+    qcf_optimizer = Adam(ac.qc.parameters(), lr=vf_lr, weight_decay=1e-2)
     if optimize_penalty:
         penalty_optimizer = Adam([penalty_param], lr=penalty_lr)
 
@@ -437,10 +447,13 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         pi_l_old = pi_l_old.item()
         v_l_old = compute_loss_v(data).item()
 
+        ave_loss_pi = 0.
+
         # Train policy with multiple steps of gradient descent
         for i in range(train_pi_iters):
             pi_optimizer.zero_grad()
             loss_pi, pi_info = compute_loss_pi(data)
+            ave_loss_pi += loss_pi
             kl = mpi_avg(pi_info['kl'])
             if kl > 1.5 * target_kl:
                 logger.log('Early stopping at step %d due to reaching max kl.' % i)
@@ -448,6 +461,8 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             loss_pi.backward()
             mpi_avg_grads(ac.pi)    # average grads across MPI processes
             pi_optimizer.step()
+
+        ave_loss_pi /= train_pi_iters
 
         logger.store(StopIter=i)
 
@@ -490,6 +505,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                      KL=kl, Entropy=ent, ClipFrac=cf,
                      DeltaLossPi=(loss_pi.item() - pi_l_old),
                      DeltaLossV=(loss_v.item() - v_l_old), **loss_info)
+        return ave_loss_pi
 
     local_num_test_episodes = int(num_test_episodes / num_procs())
     def test_agent():
@@ -497,8 +513,13 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             o, d, ep_ret, ep_cost, ep_len = test_env.reset(), False, 0, 0, 0
             o, _ = o
             while not (d or ep_len == max_ep_len):
-                a = ac.act(torch.as_tensor(o, dtype=torch.float32).to(device), deterministic=True)
+                obs = torch.as_tensor(o, dtype=torch.float32).to(device)
+                a = ac.act(obs, deterministic=True)
                 o, r, term, trunc, info = test_env.step(a)
+                if oracle is not None:
+                    oracle_pi = oracle(obs)
+                    pi = ac.pi._distribution(obs)
+                    r = -multi_kl_divergence(oracle_pi, pi)
                 d = term or trunc
                 ep_ret += r
                 ep_cost += info.get('cost', 0.)
@@ -507,6 +528,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Prepare for interaction with environment
     start_time = time.time()
+    total_reset_time = 0.
     o, ep_ret, ep_cost, ep_len, cum_cost, cum_viol = env.reset(), 0, 0, 0, 0, 0
     cum_rew = 0.
     ep_surr_cost, cum_surr_cost = 0, 0
@@ -514,16 +536,24 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
 
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
+        epoch_cost = 0
+        epoch_eps = 0
         if optimize_penalty:
             #penalty_torch = torch.exp(penalty_param)
             penalty_torch = F.softplus(penalty_param)
 
         for t in range(local_steps_per_epoch):
             # print("DEBUG o:", o)
-            ret = ac.step(torch.as_tensor(o, dtype=torch.float32).to(device))
+            obs = torch.as_tensor(o, dtype=torch.float32).to(device)
+            ret = ac.step(obs)
             # print("DEBUG ret:", ret)
             a, v, vc, logp = ret
             next_o, r, d, info = env.step(a)
+
+            if oracle is not None:
+                oracle_pi = oracle(obs)
+                pi = ac.pi._distribution(obs)
+                r = -multi_kl_divergence(oracle_pi, pi)
 
             intervened = info.get('intervened', False)
             if not intervened:
@@ -534,6 +564,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 ep_cost += c
                 ep_len += 1
                 cum_cost += c
+                epoch_cost += c
                 cum_viol += violation
                 cum_rew += r
 
@@ -552,6 +583,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                 ep_cost += c_safe
                 ep_len += 1
                 cum_cost += c_safe
+                epoch_cost += c_safe
                 cum_viol += violation
                 cum_rew += r_safe
 
@@ -586,6 +618,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                         ep_cost += c_safe
                         ep_len += 1
                         cum_cost += c_safe
+                        epoch_cost += c_safe
                         cum_rew += r_safe
                 elif env.intervener.mode == env.intervener.MODE.TERMINATE:
                     pass
@@ -617,32 +650,43 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
                     # only save EpRet / EpLen if trajectory finished
                     logger.store(EpRet=ep_ret, EpCost=ep_cost, EpLen=ep_len,
                                  EpSurrCost=ep_surr_cost)
-                sample_init_done = False
-                while not sample_init_done:
-                    o, ep_ret, ep_cost, ep_len = env.reset(), 0, 0, 0
-                    # Choose a number of steps to take under the blended policy
-                    # before starting the backup policy. This is scheduled
-                    # linearly over epochs so that at the beginning we take very
-                    # few steps under the blended policy and by the end of
-                    # training each episode is up to 70% blended data.
-                    max_oracle_steps = int(0.7 * epoch / epochs * max_ep_len)
-                    oracle_steps = max(1, np.random.randint(max_oracle_steps))
-                    sample_init_done = True
-                    for _ in range(oracle_steps):
-                        st = torch.tensor(o, dtype=torch.float32).to(device)
-                        pi = oracle(st)
-                        act = pi.sample()
-                        safety = torch.clamp(ac.qc(st, act), *ac.qc.range)
-                        if safety.item() > cost_lim:
-                            act = ac.act(st)
-                        else:
-                            act = act.detach().cpu().numpy()
-                        o, _, d, _ = env.step(act)
-                        if d:
-                            sample_init_done = False
-                            break
+                reset_start_time = time.time()
+                o, ep_ret, ep_cost, ep_len = env.reset(), 0, 0, 0
+                if reset_data is not None and np.random.random() < epoch / epochs:
+                    idx = np.random.randint(len(reset_data))
+                    (o, _, _, _) = reset_data[idx]
+                    env.reset(options=dict(state=o, steps=0))
+                # sample_init_done = False
+                # while not sample_init_done:
+                #     o, ep_ret, ep_cost, ep_len = env.reset(), 0, 0, 0
+                #     if oracle is None:
+                #         break
+                #     # Choose a number of steps to take under the blended policy
+                #     # before starting the backup policy. This is scheduled
+                #     # linearly over epochs so that at the beginning we take very
+                #     # few steps under the blended policy and by the end of
+                #     # training each episode is up to 70% blended data.
+                #     max_oracle_steps = int(0.7 * epoch / epochs * max_ep_len)
+                #     # oracle_steps = np.random.randint(max(1, max_oracle_steps))
+                #     oracle_steps = max_oracle_steps
+                #     sample_init_done = True
+                #     for _ in range(oracle_steps):
+                #         st = torch.tensor(o, dtype=torch.float32).to(device)
+                #         pi = oracle(st)
+                #         act = pi.sample()
+                #         safety = torch.clamp(ac.qc(st, act), *ac.qc.range)
+                #         if safety.item() > cost_lim:
+                #             act = ac.act(st)
+                #         else:
+                #             act = act.detach().cpu().numpy()
+                #         o, _, d, _ = env.step(act)
+                #         if d:
+                #             sample_init_done = False
+                #             break
                 ep_surr_cost, already_intv = 0, False
+                total_reset_time += time.time() - reset_start_time
                 local_episodes += 1
+                epoch_eps += 1
             elif intervened and env.intervener.mode == Intervener.MODE.SAFE_ACTION:
                 buf.finish_path(0., vc_range[1])
 
@@ -652,7 +696,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
             logger.save_state({'env': env.env}, None)
 
         # Perform PPO update!
-        update(update_penalty_every > 0 and (epoch+1) % update_penalty_every == 0)
+        epoch_loss = update(update_penalty_every > 0 and (epoch+1) % update_penalty_every == 0)
 
         # Cumulative cost calculations
         cumulative_cost = mpi_sum(cum_cost)
@@ -660,6 +704,10 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         cumulative_violations = mpi_sum(cum_viol)
         cumulative_reward = mpi_sum(cum_rew)
         episodes = mpi_sum(local_episodes)
+
+        total_epoch_cost = mpi_sum(epoch_cost)
+        total_epoch_eps = mpi_sum(epoch_eps)
+        epoch_cost_rate = total_epoch_cost / total_epoch_eps
 
         cost_rate = cumulative_cost / episodes
         surr_cost_rate = cumulative_surr_cost / episodes
@@ -671,7 +719,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         o = env.reset()
 
         if not use_logger:
-            print(f"CSC Log: Epoch {epoch}, Ret {ave_rew}, Cost {cost_rate}")
+            print(f"CSC Log: Epoch {epoch}, Ret {ave_rew}, Loss {epoch_loss}, Cost {epoch_cost_rate}")
 
         # Log info about epoch
         logger.log_tabular('Epoch', epoch)
@@ -727,5 +775,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         logger.log_tabular('Time', time.time()-start_time)
         logger.log_tabular('TotalEnvInteracts', (epoch+1)*steps_per_epoch)
         logger.dump_tabular()
+
+    print("CSC time:", time.time() - start_time, "(", total_reset_time, " spent in resets )")
 
     return ac

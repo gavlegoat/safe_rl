@@ -21,9 +21,9 @@ class Intervention(gym.Wrapper):
         super().__init__(env)
         self.intervener = intervener
 
-    def reset(self, **kwargs):
+    def reset(self, options=None, **kwargs):
         self.intervener.reset(**kwargs)
-        ret, _ = self.env.reset()
+        ret, _ = self.env.reset(options=options)
         return ret
 
     def step(self, action=None):
