@@ -187,7 +187,7 @@ def csc(env_fn, actor_critic=core.MLPActorCritic, ac_kwargs=dict(), seed=0,
         # CSC
         replay_size=int(1e6), batch_size=100, alpha=5., polyak=0.995,
         # If oracle is not None, use imitation learning
-        oracle=None, cuda=False, reset_data=None
+        oracle=None, cuda=False, reset_data=None,
         ):
     """
     Proximal Policy Optimization (by clipping),
